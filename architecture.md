@@ -1,6 +1,6 @@
 # 独立 Judge 节点架构
 
-**版本**：1.0.0  
+**版本**：1.1.0  
 **文档状态**：正式版  
 **最后更新**：2026-08-03  
 **适用范围**：当前 DevX Agent 工作流中的 Judge 节点
@@ -14,6 +14,7 @@ Judge 的最终目的只有一个：
 > 防止 Agent 操作错误、运行环境问题、外部依赖问题或证据不足，被错误包装成项目问题并写入最终报告。
 
 Judge 是工作流中的一个独立 LangGraph 节点。`PainJudge` 不是另一个节点，而是 Judge 节点内部的 `pain_review` 处理分支。
+异步复现也不是额外的 LangGraph 节点：`ReproDispatcher` 是 Judge 节点拥有的运行级后台服务，结果必须回到 Judge 状态合并后才能影响 Reporter。
 
 ## 2. 在总体架构中的位置
 
@@ -57,10 +58,11 @@ flowchart TD
     E --> F{存在候选痛点?}
     F -->|否| G[下一阶段或 Reporter]
     F -->|是| H[Judge pain_review]
-    H -->|pass| I[approved_pain_points]
-    H -->|revise| I
-    H -->|discard| J[仅保留审计记录]
-    I --> K[Reporter]
+    H -->|keep / revise| I[approved_pain_points]
+    H -->|discard / unverified| J[仅保留审计记录]
+    I --> R[异步 ReproJudge]
+    R -.主 Agent 同时继续后续任务.-> A
+    R -->|复现确认/推翻/未验证| K[Reporter 前有界收敛]
     J --> K
     K --> L[最终报告]
 ```
@@ -70,7 +72,7 @@ Judge 有两个处理时机，但只有一个节点实现：
 | `judge_stage` | 调用时机 | 主要问题 | 结果 |
 |---|---|---|---|
 | `execution` | 工具调用完成后 | Agent 是否正确执行，失败由谁负责 | `pass`、`retry`、`force_pass` |
-| `pain` | Evaluator 产生候选痛点后 | 候选问题是否是可归因于项目的真实痛点 | `pass`、`revise`、`discard` |
+| `pain` | Evaluator 产生候选痛点后 | 候选问题是否是可归因于项目的真实痛点 | `keep`、`revise`、`discard`、`unverified` |
 | `pain_reviewed` | 当前阶段痛点评审完成后 | 为后续路由标记已完成审查 | 路由到下一阶段或 Reporter |
 
 ## 4. Judge 节点的职责
@@ -112,9 +114,10 @@ Judge 必须同时检查：
 
 | 判定 | 含义 | 是否进入正式报告 |
 |---|---|---:|
-| `pass` | 事实充分且责任归属于项目 | 是 |
+| `keep` | 事实充分且责任归属于项目 | 是（若未处于待复现状态） |
 | `revise` | 事实成立，但描述或责任归因需要修正 | 使用修订后的内容 |
 | `discard` | Agent、环境、外部依赖或证据不足 | 否 |
+| `unverified` | LLM 或异步复现无法形成可靠闭环 | 否 |
 
 ## 5. 责任归因模型
 
@@ -128,7 +131,7 @@ external   第三方服务、依赖或外部组件问题
 unknown    证据不足，无法可靠归因
 ```
 
-只有 `project` 责任的问题可以成为正式项目痛点。`unknown` 默认不放行，但必须保留完整审计信息，便于人工复核。
+只有 `project` 责任的问题可以成为正式项目痛点。`unknown` 默认不放行，但必须保留完整审计信息，便于人工复核。异步复现结束后，复现推翻初审的痛点会改为 `agent`，复现未完成或结果不一致的痛点会改为 `unknown/unverified`。
 
 证据优先级固定为：
 
@@ -156,6 +159,8 @@ Judge 从 `WorkflowState` 读取：
 - Agent 实际读取到的文档和浏览器证据；
 - Evaluator 产生的候选痛点；
 - Judge 历史判决和任务级重试次数；
+- 同一任务此前 `execution_review` 的判错证据；
+- 可验证的运行环境摘要（操作系统、架构、版本、驱动和设备信息）；
 - Judge 配置、策略和知识库路径。
 
 ### 6.2 输出
@@ -184,7 +189,7 @@ Judge 从 `WorkflowState` 读取：
 {
   "judge_pain_decisions": [
     {
-      "decision": "pass | revise | discard",
+      "decision": "keep | revise | discard | unverified",
       "original_content": "Evaluator 原始候选",
       "content": "最终允许使用的内容",
       "responsibility": "project | agent | environment | external | unknown",
@@ -192,11 +197,48 @@ Judge 从 `WorkflowState` 读取：
       "reason": "判定理由"
     }
   ],
-  "judge_approved_pain_points": ["只有 pass 或 revise 的项目痛点"]
+  "judge_approved_pain_points": ["只有 keep 或 revise 的项目痛点"]
 }
 ```
 
-`judge_approved_pain_points` 是 Reporter 在 Judge 模式下唯一允许使用的正式痛点来源。
+痛点评审调用 LLM 时，逐条和批量模式必须使用同一组上下文：任务事实、文档证据、此前执行审查证据、知识库锚点和运行环境摘要。不能因为批量优化而省略责任归因依据。
+
+`judge_approved_pain_points` 是 Reporter 在 Judge 模式下唯一允许使用的正式痛点来源。列表中的痛点必须同时满足结构化裁决为 `keep/revise`、责任为 `project` 且证据非空；关联失败 `shell_exec` 的痛点还必须通过异步复现门禁。
+
+### 6.3 异步复现状态
+
+Judge 初审为项目责任、并关联失败 `shell_exec` 的痛点会产生稳定的 `repro_job_id`，后台任务状态写入：
+
+```text
+judge_repro_jobs       可序列化任务元数据，不包含 Future
+judge_repro_results    job_id 到确定性复现结果的映射
+```
+
+后台线程不直接修改 `WorkflowState`。后续 Judge 调用非阻塞收集已完成结果；仅在 `early_exit`、当前阶段为 `report` 或没有待处理任务、即将进入 Reporter 时，最多等待 `pain_repro.final_wait_timeout` 秒并形成最终状态。普通阶段不会为单条复现任务阻塞主 Agent。
+
+```text
+pending       后台执行中，主 Agent 继续
+confirmed     独立复现出现相同退出状态和同类错误，保留项目痛点并追加复现证据
+overturned    独立复现成功，改判 agent 并剔除
+unsafe        命中危险命令，不执行且不进入报告
+failed        复现执行异常，不进入报告
+timeout       最终屏障超时，不进入报告
+unverified    错误不一致或无法形成确定结论，不进入报告
+not_applicable 无关联失败 shell 命令，沿用文档/源码证据裁决
+```
+
+复现只针对以下候选提交：
+
+```text
+pain_review decision ∈ {keep, revise}
+责任归属 == project
+evidence 非空
+存在关联且失败的 shell_exec
+命令未命中 unsafe_patterns
+当前阶段尚未达到 pain_repro.max_per_phase
+```
+
+`ReproDispatcher` 使用稳定的 `run_id + phase + task_id + pain` 哈希生成任务 ID，并对同一任务去重。调度器持有的 `Future` 只存在于运行时注册表，不得写入 LangGraph 状态；状态中只保存任务元数据和可序列化的 `ReproResult`。
 
 ## 7. 触发与路由
 
@@ -232,9 +274,10 @@ Reporter 必须先对 Judge 状态进行清洗：
 
 1. Judge 开启时，丢弃未审核的候选痛点；
 2. 只读取 `judge_approved_pain_points`；
-3. `discard` 结果只留在审计日志和 `judge_pain_decisions`；
+3. `discard`、`unverified` 以及未完成复现的结果只留在审计日志和 `judge_pain_decisions`；
 4. Judge 未完成痛点评审时，不得默认把候选痛点放行；
-5. 保留原始事实与裁决结果的关联，支持报告追溯。
+5. 保留原始事实与裁决结果的关联，支持报告追溯；
+6. Reporter 再次过滤 `pending/unsafe/failed/timeout/unverified`，形成最终 fail-closed 门禁。
 
 因此，数据流必须满足：
 
@@ -253,6 +296,10 @@ Judge 审核/修订/丢弃
 Judge 的失败不能导致 Agent 无限循环，也不能静默制造结论：
 
 - 单任务重试次数由 `judge.max_retries` 和 `task_retry_counts` 限制；
+- 后台复现由 `pain_repro.max_workers` 限制并发、`max_per_phase` 限制阶段任务数；
+- 复现默认复制到临时项目快照，避免与主 Agent 同时修改工作目录；
+- Reporter 前只进行一次有界等待，普通任务和阶段流转不等待单条复现；
+- 复现快照是工作目录隔离和污染控制措施，不是硬安全边界；危险命令过滤和 Sandbox 策略仍是安全边界；
 - 同一失败操作反复出现时，停止盲目重试并记录风险；
 - Judge 超时、LLM 不可用或响应无法解析时，执行审查使用 `force_pass`；
 - 痛点评审无法验证时，候选痛点不得自动升级为正式项目问题，应标记为未验证或丢弃；
@@ -283,8 +330,19 @@ Judge 的失败不能导致 Agent 无限循环，也不能静默制造结论：
 | 文档一致性策略 | `src/workers/judge/strategies/doc_conformance.py` |
 | 非项目问题知识库 | `src/workers/judge/knowledge_base.py` |
 | 轨迹构建 | `src/workers/judge/trajectory.py` |
+| 异步复现调度 | `src/workers/judge/repro_dispatcher.py` |
+| 确定性命令复现 | `src/workers/evaluator/pain_verifier.py` |
 | Reporter 门禁 | `src/workers/reporter/worker.py` |
 | 状态字段定义 | `src/workflow/workflow.py:WorkflowState` |
+
+关键运行状态字段：
+
+| 字段 | 用途 | 约束 |
+|---|---|---|
+| `judge_approved_pain_points` | Reporter 的正式痛点输入 | 只含结构化裁决放行项，最终屏障后不得含未验证复现项 |
+| `judge_pain_decisions` | 每条候选的完整裁决和复现改判记录 | 保留 discard/unverified，支持审计 |
+| `judge_repro_jobs` | 复现任务元数据 | 可序列化，不含 Future、线程或客户端对象 |
+| `judge_repro_results` | `job_id -> ReproResult` 序列化映射 | 结果必须可写入日志和报告上下文 |
 
 ## 12. 设计边界
 
@@ -293,7 +351,7 @@ Judge 明确不负责：
 - 生成完整评估计划；
 - 替代 Executor 进行工具选择；
 - 修复项目代码或环境；
-- 重新执行工具调用；
+- 直接替代 Executor 重做普通工具调用；仅允许 ReproDispatcher 在隔离快照中执行受限复现；
 - 计算或调整项目评分；
 - 编造不存在的项目证据；
 - 将证据不足的问题强行归因给项目。
