@@ -68,23 +68,30 @@ flowchart TD
 ```mermaid
 flowchart TD
     A[Executor] --> B[Tools]
-    B --> C{风险触发策略}
-    C -->|跳过普通成功只读操作| A
-    C -->|触发审查| D[Judge execution_review]
-    D -->|pass / force_pass| A
-    D -->|retry| A
-    A --> E[Evaluator]
-    E --> F{存在候选痛点?}
-    F -->|否| G[下一阶段或 Reporter]
-    F -->|是| H[Judge pain_review]
-    H -->|keep / revise| I[approved_pain_points]
-    H -->|discard / unverified| J[仅保留审计记录]
-    I --> R[异步 ReproJudge]
-    R -.主 Agent 同时继续后续任务.-> A
-    R -->|复现确认/推翻/未验证| K[Reporter 前有界收敛]
-    J --> K
-    K --> L[最终报告]
+    B --> C[Judge 节点]
+    C --> D{风险触发策略}
+    D -->|跳过普通成功只读操作| A
+    D -->|触发审查| E[Judge execution_review]
+    E -->|pass / force_pass| A
+    E -->|retry| A
+    A --> F[Evaluator]
+    F --> G[Judge pain_review]
+    G -->|keep / revise| H[approved_pain_points]
+    G -->|discard / unverified| I[仅保留审计记录]
+    H --> N{满足复现条件?}
+    N -->|是| J[ReproDispatcher 后台复现]
+    N -->|否| K[Reporter 前有界收敛]
+    J -.主 Agent 同时继续后续任务.-> A
+    J -->|复现确认/推翻/未验证| K
+    I --> K
+    K --> L{还有后续任务?}
+    L -->|是| A
+    L -->|否| M[Reporter]
 ```
+
+说明：Evaluator 完成一个阶段后，无论是否产生候选痛点，都会先进入统一 Judge 的
+`pain_review` 阶段；没有候选痛点时 Judge 只完成阶段标记和路由，不调用无意义的逐条审查。
+`ReproDispatcher` 是 Judge 拥有的后台服务，不是额外的 LangGraph 节点。
 
 Judge 有两个处理时机，但只有一个节点实现：
 
