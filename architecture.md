@@ -1,8 +1,8 @@
 # 独立 Judge 节点架构
 
-**版本**：1.1.0  
+**版本**：1.2.0  
 **文档状态**：正式版  
-**最后更新**：2026-08-03  
+**最后更新**：2026-08-04  
 **适用范围**：当前 DevX Agent 工作流中的 Judge 节点
 
 ## 1. 文档目的
@@ -45,6 +45,25 @@ Judge 不替代 Executor、Evaluator 或 Reporter：
 | Reporter | 汇总并输出报告 | Reporter 只能使用 Judge 放行的数据 |
 
 ## 3. 核心数据流
+
+### 3.1 未启用 Judge 时的基线流程
+
+当 `judge.enabled=false`（或工作流构建器显式关闭 Judge）时，工作流不注册 `judge` 节点，
+工具执行结果直接返回 Executor，Evaluator 生成的候选痛点也直接交给后续阶段或 Reporter。
+此模式保留原始 Agent 行为，但缺少执行责任审查、PainReview 和异步痛点复现门禁。
+
+```mermaid
+flowchart TD
+    A[Planner] --> B[Executor]
+    B --> C[Tools]
+    C -->|工具结果直接返回| B
+    B -->|当前阶段任务完成| D[Evaluator]
+    D -->|还有后续阶段| B
+    D -->|全部阶段完成或提前结束| E[Reporter]
+    D -.候选观察/候选痛点.-> E
+```
+
+### 3.2 启用 Judge 时的数据流
 
 ```mermaid
 flowchart TD
@@ -224,8 +243,10 @@ unsafe        命中危险命令，不执行且不进入报告
 failed        复现执行异常，不进入报告
 timeout       最终屏障超时，不进入报告
 unverified    错误不一致或无法形成确定结论，不进入报告
-not_applicable 无关联失败 shell 命令，沿用文档/源码证据裁决
+not_eligible  无法关联失败 shell_exec、没有可执行命令或没有匹配工具调用，不提交复现，沿用文档/源码证据裁决
 ```
+
+`not_applicable` 仅作为早期状态名称兼容说明；当前实现统一写入 `not_eligible`，避免把“无需复现”和“尚未判定”混为一谈。
 
 复现只针对以下候选提交：
 
@@ -237,6 +258,12 @@ evidence 非空
 命令未命中 unsafe_patterns
 当前阶段尚未达到 pain_repro.max_per_phase
 ```
+
+痛点与工具调用的关联必须能够解析为当前任务 `tool_calls` 中的具体调用 ID。为兼容历史
+Evaluator 输出，Judge 同时接受 `tool_ids`、`tool_id`、`pain_points_tool_nums` 和
+`pain_points_tool_nums_flat`；数字引用既支持真实调用 ID，也支持任务内从 1 开始的调用序号。
+解析后只选择 `tool == shell_exec` 且执行失败的调用。无法完成映射时记录
+`repro_status=not_eligible` 和跳过原因，不会静默丢弃候选。
 
 `ReproDispatcher` 使用稳定的 `run_id + phase + task_id + pain` 哈希生成任务 ID，并对同一任务去重。调度器持有的 `Future` 只存在于运行时注册表，不得写入 LangGraph 状态；状态中只保存任务元数据和可序列化的 `ReproResult`。
 
@@ -253,6 +280,10 @@ evidence 非空
 - 返回空结果、未找到结果或关键参数由搜索结果决定。
 
 普通成功只读操作可以跳过，但跳过不能覆盖失败、证据影响或责任归因审查。
+
+`execution_review` 的 `retry` 受 `judge.max_retries` 限制（当前默认 2 次）。同一任务连续被
+Judge 判错达到上限后，不再继续循环，而是记录 `force_pass` 并放行当前结果；这表示防死循环
+的降级，不表示该操作已被 Judge 认可。
 
 ### 7.2 路由规则
 
@@ -302,6 +333,7 @@ Judge 的失败不能导致 Agent 无限循环，也不能静默制造结论：
 - 复现快照是工作目录隔离和污染控制措施，不是硬安全边界；危险命令过滤和 Sandbox 策略仍是安全边界；
 - 同一失败操作反复出现时，停止盲目重试并记录风险；
 - Judge 超时、LLM 不可用或响应无法解析时，执行审查使用 `force_pass`；
+- `judge.max_retries` 达到上限时，执行审查使用 `force_pass`，并在 Judge 日志中记录实际判错原因和重试次数；
 - 痛点评审无法验证时，候选痛点不得自动升级为正式项目问题，应标记为未验证或丢弃；
 - 所有降级都要写入 `judge_metrics`、审计日志和轨迹。
 
