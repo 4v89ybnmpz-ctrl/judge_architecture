@@ -12,6 +12,33 @@
 
 P、C、U 是代码里的局部缩写：P = Action 平台失败，C = 代码失败，U = 待定。
 
+### 1.1 run、stage、job、jid、step、msg 怎么关联
+
+先把它们看成一棵层级树：一个 **run** 是一次完整 CI 流水线执行；run 下面可以有多个 **stage**，每个 stage 可以有多个 **job**，每个 job 又由多个 **step** 组成。某个 run 失败，不表示它里面的每个 job 或 step 都失败。
+
+~~~mermaid
+flowchart TD
+    R["run：一次完整流水线执行<br/>workflow_run_id / run_id"]
+    R --> S1["stage：阶段<br/>name / identifier"]
+    S1 --> J1["job：阶段中的任务执行<br/>id / name / status / message"]
+    J1 --> T1["step：job 内的具体步骤<br/>name / task / status"]
+    S1 --> J2["另一个 job"]
+    J2 --> T2["这个 job 的多个 step"]
+~~~
+
+| 名称 | 它表示什么 | 分类时怎么用 |
+|---|---|---|
+| **run** | 一次完整 CI 执行。`workflow_run_id`（写入 labeled 时叫 `run_id`）标识这次执行。一个 run 可能包含许多成功或失败的 job。 | 分类结果按 run 记录；首轮只把窗口内的失败 run 送入 `classify_run()`。成功 run 不写成失败标签，但可供 Flaky 重跑比较。 |
+| **stage** | run 中的一组阶段，例如 image、compile、ut。 | 分类器会把 stage 名归一成 stage family，再决定走哪类规则。特殊冒烟共因统计使用 `stage.identifier` 区分具体阶段。stage 名被平台遮蔽时，加载数据阶段会尝试从同仓其他 run 恢复。 |
+| **job** | stage 里的一个任务执行。一个 stage 可以有多个 job；job 可能是矩阵任务的一个变体。 | 先只考虑带 `steps` 的叶子 job。分类时用选中 job 的状态、名称/变体名、资源类型和消息等字段。 |
+| **jid** | 选中 job 的 `job.id`，也就是 job 执行 ID；它不是另一种分类，也不是 run ID。 | 用它把失败证据和日志准确定位到该 run 下的那个 job。日志路径会同时用 `run_id`、`jid` 和 step 名；完整日志归档也按 run 与 job ID 查找。 |
+| **step** | job 内的一项具体操作，例如 download、compile 或测试。一个 job 可以有多个 step。 | 分类器先用失败 step 的结束时间比较不同失败 job；选定主 job 后，再取该 job 的 step 列表中第一个 `FAILED` step。其名称参与规则匹配，也用于定位对应日志尾。 |
+| **msg** | 平台挂在 job 上的 `job.message`，是 job 级摘要消息，不是 run 消息、step 消息或原始日志。 | 先检查它是否与平台固定失败消息完全相等；有时也会从消息文本恢复被隐藏的首个失败 step 名。没命中时再继续检查 step / 日志规则。 |
+
+**首轮主归因怎么选：** `classify_run()` 在该 run 的叶子 job 中收集 `status == FAILED` 的 job；每个 job 以最早失败 step 的 `end_time` 作为排序时间，缺少时回退到 job 的 `end_time`（仍缺失则排到最后）。排序后取最早失败的 job，再从这个 job 的 step 列表中取第一个失败 step。输出的 `stage`、job 名、`jid`、`step`、`msg` 都来自这一组被选中的证据。
+
+所以 labeled 中一行主要表达的是“**这个 run 的主失败证据**”，并不代表 run 内只有一个失败 job。其他失败 job 不会成为这行的主归因对象，但后续系统性统计等逻辑仍可能检查同一 run 的其他 job。日志则是独立证据：`msg` 是结构化字段；日志尾或完整日志是按 `run_id + jid + step` 找到的文本内容，只有前面的消息规则未命中时，首轮分类才继续用日志签名判断。
+
 ## 2. 总体流程图
 
 ~~~mermaid
