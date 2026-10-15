@@ -5,14 +5,14 @@
 
 ## 1. 要解决的问题
 
-`pipeline-skill` 的 `rules.json` 包含日志正则、规则描述和 pipeline 自身的大类/小类。CI 项目已有自己的 `cls`（责任/问题大类）、`mech`（失败模式键）和 `MECHS`（人工维护的解释与处置知识库）。两边类别含义并不完全相同，因此需要通过映射层把 pipeline 命中与 CI 现有责任边界、失败位置关联起来；pipeline 规则描述也不能直接充当已核实根因。
+`pipeline-skill` 的 `rules.json` 包含日志正则、规则描述和 pipeline 自身的大类/小类。CI 项目已有自己的 `cls`（责任/问题大类）、`mech`（失败模式键）和 `MECHS`（人工维护的解释与处置知识库）。两边类别含义并不完全相同，因此需要通过映射层把 pipeline 命中与 CI 现有责任边界、失败位置关联起来。Pipeline 可以用匹配规则和日志证据生成**运行级根因报告**；规则描述不能直接充当 CI `MECHS` 中已审定的 `cause`。
 
 本文记录有限样本中的命中情况、类别冲突和候选 mech，并描述一套将 pipeline 规则接入 CI 判定流程的方案。
 
 ## 2. 数据与规则来源
 
 - pipeline 判据库：`pipeline-skill/gate-failure-analysis/references/rules.json`，试验时版本为 v7，包含 3 个大类、31 个小类、229 条正则。
-- pipeline 日志分析器：`pipeline-skill/gate-failure-analysis/scripts/analyze_log.py`。它对日志错误行做正则搜索，并从日志尾部方向回溯；它本身不负责 CI 的 run/job 权威失败选择。
+- Pipeline run 分析器：`pipeline-skill/gate-failure-analysis/scripts/analyze_run.py` 选择失败 job、下载各 step 日志、调用日志分析器、合并同因 job 并输出报告；`analyze_log.py` 负责单份 step 日志的错误行回溯、规则命中和证据提取，不负责 run/job API 选择。
 - CI 分类器：`ci_experience_agent/observation/parser/classify.py`，先按 CI 规则选择失败 job 并分类；Flaky 复判在后续处理。
 - CI 根因知识库：`ci_experience_agent/observation/parser/mechanisms.py`。它按 `mech` 键提供人工审定的 `status`、`cause`、`evidence`、`guess`、`action`、`dest`，以及部分条目使用的 `recheck`。
 - 样本：ops-nn 已有 `labeled` 中有对应日志的记录。按 `cls` 分成“待定”“代码失败”“Action 平台失败”，每类抽 20 条，共 60 条；随机种子为 `20261015`。这是局部样本，不代表全量分布。
@@ -32,7 +32,7 @@
 
 有一条 CI 平台失败样本位于 `PreSmoke / A2_pre_smoke / smoke executor`，日志包含 `cannot find -lcust_opapi`。pipeline 将该日志命中为 `code/compile_error`，而 CI 现有规则归为“冒烟产物缺件”。这说明日志命中需要结合失败位置上下文，并遵循 CI 分类器的优先级。
 
-## 4. 新 mech 候选及其字段来源
+## 4. CI 侧候选 mech 讨论及字段来源（非 Pipeline 分析器输出）
 
 候选名称：**平台插件下载失败**。此前讨论中也出现过“执行机插件下载/加载失败”这一拟名；“执行机”来自 pipeline 的 `Runner机器异常` 小类，不是日志原文。当前名称贴近 pipeline 判据描述，仍未加入 CI `MECHS`。
 
@@ -77,7 +77,11 @@ pipeline 大类与 CI 大类之间不要求名称或数量相等。同一 pipeli
 
 ### 5.4 判据与根因知识分层
 
-pipeline 正则识别“日志出现了什么签名”；CI `MECHS` 记录已核实的失败事实、证据、推测、处置动作和去向。pipeline 命中可以关联到已有 mech，也可以形成待人工判读的新 mech 候选。人工审定之前，不生成根因文本，不把候选写入正式知识库。
+Pipeline 单次 run 报告会根据已命中的规则、捕获值和日志证据，生成这次运行的根因结果，并把同因 job 聚合起来。这个结果是**运行级诊断输出**。
+
+CI `MECHS` 是**跨 run 复用的人工审定知识条目**，记录已核实事实、证据、推测、处置动作和去向。Pipeline 报告里的 `rule_desc` 是判据模板生成的运行级说明，可以与证据一起呈现；它不能仅因正则命中就自动成为 `MECHS.cause`。因此要分清两件事：Pipeline 可以按规则生成一条有证据支撑的 run 级根因报告；把其中反复出现的失败模式沉淀为 CI `MECHS`，仍需按 CI 的证据标准审定。
+
+Pipeline 从单次匹配到最终报告的详细步骤及 `ops-nn run#8355` 例子见 [`融合方案.md`](融合方案.md)。
 
 ## 6. 当前状态与边界
 
